@@ -1,0 +1,4 @@
+# 줄바꿈은 LF로 고정한다. CRLF로 체크아웃되면 selfcheck.js의 소스 파싱이 깨진다.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

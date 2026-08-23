@@ -1,0 +1,1233 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>잠가! 열어! 꺼! — 가스안전 3분 챌린지</title>
+<style>
+  html,body{margin:0;height:100%;background:#1A1D23;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;}
+  body{display:flex;align-items:center;justify-content:center;}
+  canvas{display:block;touch-action:none;}
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+'use strict';
+// ══════════════════════════════════════════════════════════════
+// 「잠가! 열어! 꺼!」 — 가스안전 3분 챌린지
+// 단일 index.html / Canvas 2D / 라이브러리·네트워크·스토리지 없음
+//
+// 설계 원칙: 미션은 데이터다.
+//   새 미션 = MISSIONS 배열에 객체 하나 + CHECKS에 판정 함수 하나.
+//   (연출이 필요하면 FX에 함수 하나. 엔진은 건드리지 않는다.)
+// ══════════════════════════════════════════════════════════════
+
+const W = 1080, H = 1920;                        // 기준 캔버스 (9:16)
+const FONT = 'system-ui, -apple-system, "Malgun Gothic", sans-serif';
+const MIN_TOUCH = 140;                           // 최소 터치 타깃 (8장)
+const A5_NEED = 5;                               // A5 연타로 채워야 하는 게이지
+
+// 공통 색상 (2장)
+const C = {
+  void:  '#1A1D23',   // 배경/레터박스
+  hud:   '#12151B',
+  ink:   '#0E1116',   // 굵은 외곽선
+  safe:  '#2ECC8F',   // 안전/성공
+  danger:'#E8563A',   // 위험/실패
+  warn:  '#F5A623',   // 경고/주의
+  gray:  '#4A5160',   // 중립 오브젝트
+  text:  '#FFFFFF',
+  dim:   '#8891A0',
+  slot:  '#3A414F'
+};
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+// ══ 사운드 (7장) ═══════════════════════════════════════════════
+// 전부 오실레이터로 직접 연주한다. 음원 파일이 없으니 저작권 확인이 필요 없고,
+// 라운드별 템포 상승이 숫자 하나로 끝난다.
+//   AC ─┬─ SFX ──┐
+//       └─ BGMG ─┴─ BUS ─ 출력       (실패 시 BGMG만 잠깐 죽인다)
+const AudioCtx = globalThis.AudioContext || globalThis.webkitAudioContext;
+let AC = null, BUS = null, BGMG = null;
+function initAudio() {
+  if (!AC && AudioCtx) {
+    try {
+      AC = new AudioCtx();
+      BUS = AC.createGain();  BUS.gain.value = .9;   BUS.connect(AC.destination);
+      BGMG = AC.createGain(); BGMG.gain.value = .34; BGMG.connect(BUS);
+    } catch (e) { AC = null; }
+  }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function tone(freq, dur, type, vol, delay, slideTo) {
+  if (!AC) return;
+  const t0 = AC.currentTime + (delay || 0);
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, t0);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(vol || 0.18, t0 + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g).connect(BUS);
+  o.start(t0); o.stop(t0 + dur + 0.03);
+}
+function noise(dur, vol) {
+  if (!AC) return;
+  const n = Math.floor(AC.sampleRate * dur), b = AC.createBuffer(1, n, AC.sampleRate), d = b.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+  const s = AC.createBufferSource(); s.buffer = b;
+  const f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 900;
+  const g = AC.createGain(); g.gain.value = vol || 0.25;
+  s.connect(f).connect(g).connect(BUS); s.start();
+}
+// 절대 시각에 예약하는 한 음 (BGM 시퀀서용)
+function noteAt(freq, dur, type, vol, when, dest) {
+  if (!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, when);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(vol, when + .008);
+  g.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+  o.connect(g).connect(dest || BUS);
+  o.start(when); o.stop(when + dur + .02);
+}
+// 실패 순간 BGM만 잠깐 죽인다 — 효과음이 훨씬 세게 들린다
+function duck() {
+  if (!BGMG) return;
+  const t = AC.currentTime;
+  BGMG.gain.cancelScheduledValues(t);
+  BGMG.gain.setValueAtTime(BGMG.gain.value, t);
+  BGMG.gain.linearRampToValueAtTime(.03, t + .04);
+  BGMG.gain.linearRampToValueAtTime(.34, t + .55);
+}
+const SFX = {
+  // 콤보가 쌓일수록 반음씩 올라간다. 잘하고 있다는 걸 귀로 알려준다.
+  success: (combo) => {
+    const k = Math.pow(1.0595, Math.min(combo || 0, 12));
+    tone(880 * k, .12, 'triangle', .20);
+    tone(1320 * k, .20, 'triangle', .17, .10);
+  },
+  fast:    () => { tone(1568, .07, 'square', .14); tone(2093, .10, 'square', .12, .06); },
+  fail:    () => tone(320, .30, 'sawtooth', .16, 0, 90),
+  boom:    () => { noise(.45, .30); tone(70, .40, 'sine', .26, 0, 40); },
+  tick:    () => tone(1400, .05, 'square', .11),
+  grade:   () => [523, 659, 784, 1047].forEach((f, i) => tone(f, .24, 'triangle', .16, i * .13))
+};
+
+// ══ BGM — 오실레이터 시퀀서 ════════════════════════════════════
+// requestAnimationFrame으로 음을 '재생'하면 박자가 흔들린다.
+// 오디오 시계(AC.currentTime) 기준으로 앞으로 120ms 분량을 미리 예약한다.
+const BGM_BASS = [0, 0, 7, 0, 5, 5, 3, 3];       // A2 기준 반음 오프셋
+const BGM_HAT  = [1, 0, 1, 1, 1, 0, 1, 1];
+const BGM_BPM  = [104, 124, 146];                // 라운드별 템포 = 가속을 귀로 느끼게
+let bgmOn = false, bgmStep = 0, bgmAt = 0;
+
+function bgmStart() { bgmOn = true; bgmStep = 0; bgmAt = AC ? AC.currentTime + .05 : 0; }
+function bgmStop()  { bgmOn = false; }
+function bgmTick() {
+  if (!bgmOn || !AC) return;
+  const bpm = BGM_BPM[Math.min(G.roundIdx, BGM_BPM.length - 1)];
+  const step = 30 / bpm;                          // 8분음표 길이(초)
+  if (bgmAt < AC.currentTime) bgmAt = AC.currentTime + .05;
+  while (bgmAt < AC.currentTime + .12) {
+    const i = bgmStep % 8;
+    if (i % 4 === 0) noteAt(96, .13, 'sine', .5, bgmAt, BGMG);                    // 킥
+    noteAt(110 * Math.pow(2, BGM_BASS[i] / 12), step * .9, 'square', .16, bgmAt, BGMG);
+    if (BGM_HAT[i]) noteAt(7400, .022, 'square', .05, bgmAt, BGMG);               // 하이햇
+    bgmAt += step;
+    bgmStep++;
+  }
+}
+
+// ══ 에셋 (6장) ═════════════════════════════════════════════════
+// asset_web/ 가공본을 경로로 참조한다 (인라인 없음).
+//   원본 asset/ → asset_web/ 변환: python tools/prep_assets.py
+// 오브젝트에 img, 미션에 bgImage 로 파일명(확장자 제외)을 적으면 자동으로 쓰인다.
+// 파일이 없거나 아직 로딩 전이면 색 사각형 + 라벨로 폴백한다.
+// 에셋은 미션끼리 공유하므로 파일명은 {미션ID}_ 접두어 대신 원본 이름을 그대로 쓴다.
+const ASSET_DIR = 'asset_web/';
+const IMG = {};
+function asset(name, ext) {
+  let i = IMG[name];
+  if (!i) { i = IMG[name] = new Image(); i.src = ASSET_DIR + name + (ext || '.png'); }
+  return i.complete && i.naturalWidth > 0 ? i : null;
+}
+// 비율을 유지해 박스 안에 맞춘다. 스펙 좌표와 그림 비율이 달라도 찌그러지지 않는다.
+function fit(iw, ih, bw, bh) {
+  const s = Math.min(bw / iw, bh / ih);
+  return { w: iw * s, h: ih * s };
+}
+
+// ══ 미션 데이터 (4장) ══════════════════════════════════════════
+const MISSIONS = [
+
+  // ── A군. 이동식 부탄연소기 (5개) ──────────────────────────────
+  { id:'A1', hint:['can','zone'], group:'부탄연소기', cue:'빼!', check:'checkA1', timeLimit:5000, bg:'#2A2F3A', bgImage:'bg_camp',
+    rule:'조리가 끝나면 부탄캔을 즉시 분리한다',
+    successMsg:'잔열로 캔이 터질 수 있어요',
+    objects:[
+      { key:'stove', label:'휴대용 버너', x:540, y:1150, w:620, h:300, color:C.gray,    interact:'none', img:'04obj_stove' },
+      { key:'can',   label:'부탄캔',      x:840, y:1240, w:180, h:300, color:'#E8763A', interact:'drag', img:'01obj_can' },
+      { key:'zone',  label:'안전 보관함',  x:540, y:1720, w:300, h:310, color:C.safe,    interact:'none', zone:true, img:'13obj_zone_safe' }
+    ]},
+
+  { id:'A2', hint:['smallPan','stove'], group:'부탄연소기', cue:'바꿔!', check:'checkA2', timeLimit:5000, bg:'#2A2F3A', bgImage:'bg_camp',
+    rule:'삼발이보다 큰 불판은 부탄캔을 과열시킨다',
+    successMsg:'큰 불판은 캔을 달굽니다',
+    trapReason:'가열 중 캔을 만졌습니다',
+    objects:[
+      { key:'bigPan',   label:'큰 불판',   x:540, y:1010, w:700, h:200, color:'#6B7280', interact:'none', img:'14obj_pan_big' },
+      { key:'stove',    label:'버너',      x:540, y:1250, w:560, h:270, color:C.gray,    interact:'none', img:'04obj_stove', zone:true },
+      { key:'can',      label:'부탄캔',    x:880, y:1290, w:180, h:300, color:'#E8763A', interact:'tap', trap:true, img:'01obj_can' },
+      { key:'smallPan', label:'작은 불판',  x:430, y:1620, w:510, h:150, color:'#8A93A3', interact:'drag', img:'15obj_pan_small' }
+    ]},
+
+  { id:'A3', hint:['can'], group:'부탄연소기', cue:'맞춰!', check:'checkA3', timeLimit:5000, bg:'#2A2F3A', bgImage:'bg_camp',
+    rule:'부탄캔 절단면 홈을 연소기 돌기에 맞춰 장착한다',
+    successMsg:'홈이 맞아야 가스가 새지 않아요',
+    objects:[
+      { key:'guide', label:'',            x:540, y:1200, w:400, h:400, color:C.safe,    interact:'none' },
+      { key:'can',   label:'부탄캔',       x:540, y:1200, w:200, h:340, color:'#E8763A', interact:'rotate', targetAngle:90, tolerance:15, img:'02obj_can_groove' }
+    ]},
+
+  { id:'A4', hint:['can','shade'], group:'부탄연소기', cue:'치워!', check:'checkA4', timeLimit:5000, bg:'#33302E', bgImage:'bg_camp',
+    rule:'부탄캔을 직사광선·차량 안에 두지 않는다',
+    successMsg:'햇볕에 두면 캔 내부 압력이 올라가요',
+    objects:[
+      { key:'sun',   label:'☀ 햇볕 구역',  x:540, y:900,  w:1080, h:500, color:'rgba(245,166,35,.30)', interact:'none', overlay:true },
+      { key:'can',   label:'부탄캔',       x:540, y:950,  w:180,  h:300, color:'#E8763A', interact:'drag', img:'01obj_can' },
+      { key:'shade', label:'그늘 보관함',   x:540, y:1650, w:413,  h:300, color:C.safe,    interact:'none', zone:true, img:'17obj_shade' }
+    ]},
+
+  { id:'A5', hint:['can'], group:'부탄연소기', cue:'뚫어!', check:'checkA5', timeLimit:5000, bg:'#2A2F3A', bgImage:'bg_camp',
+    rule:'다 쓴 부탄캔은 구멍을 뚫어 가스를 빼고 버린다',
+    successMsg:'잔가스가 남으면 폭발합니다',
+    trapReason:'가스가 남은 채 버렸습니다',
+    objects:[
+      { key:'can',   label:'다 쓴 부탄캔', x:400, y:1300, w:200, h:340, color:'#E8763A', interact:'tap',  img:'03obj_can_empty' },
+      { key:'punch', label:'구멍뚫이',     x:400, y:1300, w:120, h:120, color:'#C9CDD6', interact:'none', img:'18obj_punch' },
+      { key:'bin',   label:'일반 쓰레기통', x:830, y:1600, w:300, h:319, color:'#5A6474', interact:'tap',  trap:true, img:'19obj_bin' }
+    ]},
+
+  // ── B군. 가스레인지·중간밸브 (3개) ────────────────────────────
+  { id:'B1', hint:['knob'], group:'가스레인지', cue:'꺼!', check:'checkB1', timeLimit:5000, bg:'#26303A', bgImage:'bg_kitchen',
+    rule:'자리를 비울 때는 반드시 불을 끈다',
+    successMsg:'잠깐이라도 자리를 뜨면 끕니다',
+    trapReason:'불을 켠 채 자리를 떴습니다',
+    objects:[
+      { key:'pot',  label:'끓는 냄비',   x:540, y:1050, w:400, h:440, color:'#7A8595', interact:'none', img:'09obj_pot' },
+      { key:'knob', label:'화구 손잡이', x:540, y:1400, w:220, h:220, color:'#C9CDD6', interact:'tap',  img:'20obj_knob' },
+      { key:'door', label:'현관문',      x:880, y:1500, w:260, h:460, color:'#8C6239', interact:'tap',  trap:true, img:'08obj_door' }
+    ]},
+
+  // 밸브 그림에 배관과 흐름 화살표가 함께 그려져 있어 이미지 한 장을 통째로 회전시킨다.
+  // 따라서 별도 pipe 오브젝트를 두지 않는다.
+  { id:'B2', hint:['valve'], group:'중간밸브', cue:'잠가!', check:'checkB2', timeLimit:5000, bg:'#26303A', bgImage:'bg_kitchen',
+    rule:'사용 후에는 중간밸브를 잠근다',
+    successMsg:'손잡이가 배관과 직각이면 잠김입니다',
+    objects:[
+      { key:'valve', label:'중간밸브', x:540, y:1300, w:880, h:318, color:'#E8563A', interact:'rotate', targetAngle:90, tolerance:15, img:'11obj_valve' }
+    ]},
+
+  // 리듬 세상식 '타이밍' 미션. 15미션 중 유일하게 "무엇"이 아니라 "언제"를 묻는다.
+  // TODO(spec): 재점화 수칙(점화 실패 시 잠그고 환기 후 재시도)을 KGS 원문으로 확인 — 11장
+  { id:'B4', hint:['igniter'], group:'가스레인지', cue:'기다려!', check:'checkB4', timeLimit:5000, bg:'#26303A', bgImage:'bg_kitchen',
+    rule:'점화가 안 되면 바로 다시 켜지 말고 가스를 잠그고 환기한 뒤 시도한다',
+    successMsg:'고인 가스가 빠진 뒤에 점화합니다',
+    objects:[
+      { key:'igniter', label:'점화 버튼', x:540, y:1450, w:260, h:260, color:'#C9CDD6', interact:'tap', img:'20obj_knob' }
+    ]},
+
+  { id:'B3', hint:['slider'], group:'가스레인지', cue:'내려!', check:'checkB3', timeLimit:5000, bg:'#26303A', bgImage:'bg_kitchen',
+    rule:'과열은 냄비를 넘치게 해 불을 꺼뜨리고 가스를 새게 한다',
+    successMsg:'넘친 국물이 불을 끄면 가스가 샙니다',
+    objects:[
+      { key:'pot',    label:'넘치려는 냄비',  x:540, y:1000, w:420, h:462, color:'#7A8595', interact:'none', img:'09obj_pot' },
+      { key:'track',  label:'',              x:540, y:1500, w:160, h:560, color:'#2B3040', interact:'none', img:'21obj_track' },
+      { key:'slider', label:'화력',           x:540, y:1300, w:120, h:120, color:C.warn,    interact:'drag', axis:'y', clamp:[1280,1720], img:'22obj_slider' }
+    ]},
+
+  // ── C군. 누출 대응 순서 (4개) — 게임의 심장 ────────────────────
+  { id:'C1', hint:['window'], group:'누출대응', cue:'열어!', check:'checkC1', timeLimit:5000, bg:'#242A36', bgImage:'bg_kitchen_gas', fog:'gas',
+    rule:'가스 냄새가 나면 가장 먼저 창문을 열어 환기한다',
+    successMsg:'환기가 1순위입니다',
+    trapReason:'전기 스위치가 점화원이 됩니다',
+    objects:[
+      { key:'fan',    label:'환풍기',      x:220, y:1120, w:300, h:300, color:'#6B7A8F', interact:'tap', trap:true, img:'07obj_fan' },
+      { key:'light',  label:'전등 스위치',  x:540, y:1120, w:300, h:300, color:'#EDEFF3', interact:'tap', trap:true, img:'06obj_light' },
+      { key:'window', label:'창문',        x:860, y:1120, w:300, h:300, color:'#3E5A78', interact:'tap', img:'23obj_window1' }
+    ]},
+
+  { id:'C2', hint:['valve'], group:'누출대응', cue:'잠가!', check:'checkC2', timeLimit:5000, bg:'#242A36', bgImage:'bg_kitchen_gas', fog:'gas',
+    rule:'환기 후 가스 중간밸브와 용기밸브를 잠근다',
+    successMsg:'환기 다음은 밸브 차단입니다',
+    objects:[
+      { key:'valve', label:'중간밸브', x:540, y:1250, w:880, h:318, color:'#E8563A', interact:'rotate', targetAngle:90, tolerance:15, img:'11obj_valve' }
+    ]},
+
+  { id:'C3', hint:['door'], group:'누출대응', cue:'나가!', check:'checkC3', timeLimit:5000, bg:'#242A36', bgImage:'bg_kitchen_gas', fog:'gas',
+    rule:'가스 냄새가 나면 전기 스위치를 만지지 말고 밖에서 신고한다',
+    // TODO(spec): 신고 번호 공식 표기(119 / 1544-4500 병기 여부) 확정 후 successMsg에 병기 — 12장
+    successMsg:'밖으로 나와 신고하세요',
+    trapReason:'전기 불꽃이 가스에 옮겨붙었습니다',
+    objects:[
+      { key:'fan',   label:'환풍기',      x:300, y:940,  w:340, h:340, color:'#6B7A8F', interact:'tap', trap:true, img:'07obj_fan' },
+      { key:'light', label:'전등 스위치',  x:780, y:940,  w:340, h:340, color:'#EDEFF3', interact:'tap', trap:true, img:'06obj_light' },
+      { key:'phone', label:'휴대폰',      x:300, y:1300, w:340, h:340, color:'#2E3440', interact:'tap', trap:true, img:'25obj_phone' },
+      { key:'door',  label:'현관문',      x:780, y:1300, w:340, h:340, color:'#8C6239', interact:'tap', img:'08obj_door' }
+    ]},
+
+  // 실제 비눗물 점검은 '바르고 문지르는' 동작이다. 고르기가 아니라 문지르기로 둔다.
+  { id:'C4', hint:['hose'], group:'누출대응', cue:'문질러!', check:'checkC4', timeLimit:5000, bg:'#242A36', bgImage:'bg_kitchen',
+    rule:'비눗물을 발라 거품이 이는 곳이 누출 지점이다',
+    successMsg:'비눗물 점검은 누구나 할 수 있어요',
+    objects:[
+      { key:'hose', label:'가스 호스', x:540, y:1200, w:800, h:200, color:C.gray, interact:'rub', img:'26obj_hose' }
+    ]},
+
+  // ── D군. CO·막음조치·보일러 (3개) ─────────────────────────────
+  { id:'D1', hint:['box','zone'], group:'CO·보일러', cue:'가리지 마!', check:'checkD1', timeLimit:5000, bg:'#2B2F38', bgImage:'bg_boiler',
+    rule:'보일러 배기구 앞에는 아무것도 두지 않는다',
+    successMsg:'배기구가 막히면 일산화탄소가 역류합니다',
+    // 보일러는 배경(bg_boiler)에 이미 그려져 있어 오브젝트로 얹지 않는다
+    objects:[
+      { key:'vent',   label:'배기구',   x:540, y:1150, w:260, h:160, color:'#454C5A', interact:'none', img:'28obj_vent' },
+      { key:'box',    label:'쌓인 짐',  x:540, y:1250, w:320, h:300, color:'#A9793F', interact:'drag', img:'27obj_box' },
+      { key:'zone',   label:'치울 곳',  x:200, y:1700, w:340, h:300, color:C.safe,    interact:'none', zone:true }
+    ]},
+
+  { id:'D2', hint:['pipe','socket'], group:'CO·보일러', cue:'꽂아!', check:'checkD2', timeLimit:5000, bg:'#2B2F38', bgImage:'bg_boiler',
+    rule:'보일러 배기통 이탈 여부를 정기적으로 확인한다',
+    successMsg:'배기통이 빠지면 일산화탄소가 실내로 들어옵니다',
+    // 보일러는 배경에 있다. 판정에 쓰이는 연결부와 배기통만 오브젝트로 둔다.
+    objects:[
+      { key:'socket', label:'연결부',      x:660, y:900,  w:140, h:140, color:C.safe,    interact:'none', zone:true, snap:80 },
+      { key:'pipe',   label:'빠진 배기통',  x:700, y:1500, w:300, h:140, color:'#6B7280', interact:'drag', img:'28obj_vent' }
+    ]},
+
+  { id:'D3', hint:['heater','zipper'], group:'CO·보일러', cue:'빼!', check:'checkD3', timeLimit:5000, bg:'#232A2E', bgImage:'bg_tent', fog:'co', fogBox:'tent',
+    rule:'텐트·차량 안에서 난방기를 사용하지 않는다',
+    successMsg:'밀폐 공간의 일산화탄소는 냄새가 없습니다',
+    trapReason:'난방기를 켠 채 잠들었습니다',
+    objects:[
+      { key:'tent',   label:'',            x:540, y:1100, w:900, h:700, color:'rgba(0,0,0,0)', interact:'none', overlay:true },
+      { key:'heater', label:'난방기',       x:450, y:1300, w:240, h:260, color:'#E8563A', interact:'drag', img:'29obj_heater' },
+      { key:'sleep',  label:'잠든 사람',    x:750, y:1300, w:220, h:200, color:'#5C6B7A', interact:'tap', trap:true },
+      { key:'zipper', label:'텐트 출입구',   x:540, y:1750, w:300, h:200, color:C.safe,    interact:'none', zone:true }
+    ]}
+];
+
+// ══ 판정 (3.4장) ═══════════════════════════════════════════════
+// 15개 미션이 네 가지 패턴으로 수렴한다. 팩토리로 만들고 특수 케이스 3개만 손으로 쓴다.
+// 반환: {result:'success'} | {result:'fail', reason} | null(판정 보류)
+
+const obj = (m, k) => m.objs.find(o => o.key === k);
+const within = (o, x, y) => Math.abs(x - o.x) <= o.w / 2 && Math.abs(y - o.y) <= o.h / 2;
+const inRect = (a, b) => within(b, a.x, a.y);   // a의 중심이 b 안에 있는가
+
+// 정해진 오브젝트를 탭하면 성공
+const tapTarget = (key, timeoutReason) => (m, ev) =>
+    ev.type === 'tap' && ev.objKey === key   ? { result:'success' }
+  : ev.type === 'timeout'                    ? { result:'fail', reason:timeoutReason }
+  : null;
+
+// 오브젝트를 목표 영역 안으로 드래그
+const dragZone = (key, zoneKey, failReason, timeoutReason) => (m, ev) => {
+  if (ev.type === 'dragEnd' && ev.objKey === key)
+    return inRect(obj(m, key), obj(m, zoneKey)) ? { result:'success' } : { result:'fail', reason:failReason };
+  if (ev.type === 'timeout' && timeoutReason) return { result:'fail', reason:timeoutReason };
+  return null;
+};
+
+// 오브젝트를 목표 지점 근처(반경 dist)로 드래그
+const dragNear = (key, targetKey, dist, failReason, timeoutReason) => (m, ev) => {
+  if (ev.type === 'dragEnd' && ev.objKey === key) {
+    const a = obj(m, key), b = obj(m, targetKey);
+    return Math.hypot(a.x - b.x, a.y - b.y) <= dist ? { result:'success' } : { result:'fail', reason:failReason };
+  }
+  if (ev.type === 'timeout' && timeoutReason) return { result:'fail', reason:timeoutReason };
+  return null;
+};
+
+// 오브젝트를 기준선 아래로 드래그. failReason이 없으면 놓쳐도 재시도 가능
+const dragBelow = (key, minY, failReason, timeoutReason) => (m, ev) => {
+  if (ev.type === 'dragEnd' && ev.objKey === key) {
+    if (obj(m, key).y >= minY) return { result:'success' };
+    return failReason ? { result:'fail', reason:failReason } : null;
+  }
+  if (ev.type === 'timeout' && timeoutReason) return { result:'fail', reason:timeoutReason };
+  return null;
+};
+
+// 목표 각도까지 회전. 반대 방향으로 같은 각도만큼 돌리면 실패
+const rotateTo = (key, reverseReason, timeoutReason) => (m, ev) => {
+  if (ev.type === 'rotate' && ev.objKey === key) {
+    const o = obj(m, key), tol = o.tolerance || 15;
+    if (Math.abs(ev.angle - o.targetAngle) <= tol) { m.s.locked = true; return { result:'success' }; }
+    if (reverseReason && Math.abs(ev.angle + o.targetAngle) <= tol) return { result:'fail', reason:reverseReason };
+  }
+  if (ev.type === 'timeout' && timeoutReason) return { result:'fail', reason:timeoutReason };
+  return null;
+};
+
+// C4 누출 지점은 매 플레이 랜덤 — 호스 그림의 연결부 3곳 중 하나 (4장 C4 주의사항)
+const c4Leak = m => m.s.leakX || (m.s.leakX = [297, 540, 772][Math.floor(Math.random() * 3)]);
+// 누출 지점(반경 95px) 위를 지나간 거리의 합. 한 번 훑고 지나가면 약 190px가 쌓이므로
+// 900이면 5번쯤 문질러야 한다 — 2초 남짓. 한 번에 끝나면 '문지르기'로 느껴지지 않는다.
+const C4_NEED = 900;
+const B4_SAFE = [.62, .86];       // 가스가 빠져 점화해도 되는 구간 (진행률)
+
+const CHECKS = {
+  checkA1: dragZone('can', 'zone', '캔이 버너에 남았습니다'),                    // timeout → 엔진 기본 '시간 초과'
+  checkA3: rotateTo('can', null, '홈이 어긋난 채 장착됐습니다'),
+  checkA4: dragZone('can', 'shade', '캔이 햇볕에 남았습니다', '캔이 햇볕에 남았습니다'),
+  checkB2: rotateTo('valve', '밸브를 반대로 돌렸습니다', '밸브가 열려 있습니다'),
+  checkB3: dragBelow('slider', 1650, '화력이 그대로입니다', '화력이 그대로입니다'),
+  checkC1: tapTarget('window', '환기하지 못했습니다'),
+  checkC2: rotateTo('valve', '밸브를 반대로 돌렸습니다'),
+  checkC3: tapTarget('door', '대피가 늦었습니다'),
+  checkD1: dragZone('box', 'zone', '배기구가 막혀 있습니다', '배기구가 막혀 있습니다'),
+  checkD2: dragNear('pipe', 'socket', 80, '배기통이 빠져 있습니다', '배기통이 빠져 있습니다'),
+  checkD3: dragBelow('heater', 1700, null, '일산화탄소가 가득 찼습니다'),
+
+  // A2: 작은 불판을 버너 위로 옮기면 큰 불판이 내려간다
+  checkA2(m, ev) {
+    const r = dragZone('smallPan', 'stove', '불판이 그대로입니다', '불판이 캔을 덮고 있습니다')(m, ev);
+    if (r && r.result === 'success') {
+      const st = obj(m, 'stove'), sp = obj(m, 'smallPan');
+      obj(m, 'bigPan').hidden = true;
+      sp.x = st.x; sp.y = st.y - 96;                  // 버너 위에 얹힌다
+    }
+    return r;
+  },
+
+  // A5: 연타 미션. 손이 느려지면 게이지가 샌다 — 진짜 두들겨야 한다
+  checkA5(m, ev) {
+    if (ev.type === 'tap' && ev.objKey === 'can') {
+      const gap = m.elapsed - (m.s.t === undefined ? m.elapsed : m.s.t);
+      m.s.hits = Math.max(0, (m.s.hits || 0) - gap / 800) + 1;
+      m.s.t = m.elapsed;
+      return m.s.hits >= A5_NEED ? { result:'success' } : null;
+    }
+    if (ev.type === 'timeout') return { result:'fail', reason:'구멍을 다 뚫지 못했습니다' };
+    return null;
+  },
+
+  // B4: 가스가 빠진 뒤에 점화한다. 조급하면 고인 가스에 불이 붙는다.
+  checkB4(m, ev) {
+    if (ev.type === 'tap' && ev.objKey === 'igniter') {
+      const p = 1 - m.left / m.limit;
+      if (p >= B4_SAFE[0] && p <= B4_SAFE[1]) return { result:'success' };
+      return { result:'fail', reason: p < B4_SAFE[0] ? '고인 가스에 불이 붙었습니다' : '너무 오래 기다렸습니다' };
+    }
+    if (ev.type === 'timeout') return { result:'fail', reason:'점화하지 못했습니다' };
+    return null;
+  },
+
+  // B1: 성공 시 불꽃이 꺼진다 (연출은 FX.B1)
+  checkB1(m, ev) {
+    const r = tapTarget('knob', '냄비가 끓어 넘쳤습니다')(m, ev);
+    if (r && r.result === 'success') m.s.off = true;
+    return r;
+  },
+
+  // C4: 호스에 비눗물을 문지른다. 누출 지점 위를 충분히 문지르면 거품이 인다.
+  checkC4(m, ev) {
+    if (ev.type === 'rub' && ev.objKey === 'hose') {
+      m.s.x0 = Math.min(m.s.x0 === undefined ? ev.x : m.s.x0, ev.x);   // 비눗물 칠해진 범위
+      m.s.x1 = Math.max(m.s.x1 === undefined ? ev.x : m.s.x1, ev.x);
+      if (Math.abs(ev.x - c4Leak(m)) < 95) {
+        m.s.found = (m.s.found || 0) + ev.dist;
+        if (m.s.found >= C4_NEED) return { result:'success' };
+      }
+      return null;
+    }
+    if (ev.type === 'timeout') return { result:'fail', reason:'누출 지점을 찾지 못했습니다' };
+    return null;
+  }
+};
+
+// ══ 라운드 구성 (3.7장) ════════════════════════════════════════
+// 순서 고정. 랜덤 셔플 없음(영상 촬영 재현성). C3는 마지막 = 클라이맥스.
+const ROUND_IDS = [
+  ['A1', 'C1', 'B1', 'D1', 'A2'],
+  ['C2', 'A3', 'D2', 'B2', 'C4', 'B4'],   // B4(타이밍)는 3초 라운드에선 너무 빡빡해 라운드2에 둔다
+  ['A4', 'D3', 'B3', 'A5', 'C3']          // C3가 마지막 = 클라이맥스 (3.7장)
+];
+const MULTS = [1.0, 0.8, 0.6];
+
+// MISSIONS에만 추가된 미션(E군 등)은 마지막 라운드에 자동 편성된다.
+// 반대로 MISSIONS에서 뺀 미션(10장 축소 시나리오)은 자동으로 빠진다.
+{
+  const listed = new Set(ROUND_IDS.reduce((a, b) => a.concat(b), []));
+  for (const m of MISSIONS) if (!listed.has(m.id)) ROUND_IDS[ROUND_IDS.length - 1].push(m.id);
+}
+const ROUNDS = ROUND_IDS.map((ids, i) => ({
+  mult: MULTS[i] !== undefined ? MULTS[i] : MULTS[MULTS.length - 1],
+  defs: ids.map(id => MISSIONS.find(m => m.id === id)).filter(Boolean)
+}));
+const TOTAL = ROUNDS.reduce((n, r) => n + r.defs.length, 0);
+
+// 에셋 선로딩 — 첫 미션에서 그림이 늦게 뜨지 않게
+for (const m of MISSIONS) {
+  if (m.bgImage) asset(m.bgImage, '.jpg');
+  for (const o of m.objects) if (o.img) asset(o.img);
+}
+
+// ══ 상태 (3.5장) ═══════════════════════════════════════════════
+// MISSION_RESULT는 수칙을 끝까지 읽을 시간이다. 이 게임의 교육 산출물이 그 한 줄이라 짧으면 안 된다.
+const DUR = { ROUND_INTRO:1200, MISSION_RETRY:500, MISSION_CUE:700, MISSION_RESULT:2000, ROUND_RESULT:2000, ENDING:30000 };
+const MAX_RETRY = 2;   // 3.8장: 라운드당 재출제 최대 2개
+
+const G = {
+  state:'BOOT', t:0,
+  lives:3, roundIdx:0, missionIdx:0, done:0,
+  combo:0, best:0,        // 연속 성공 — 바닥은 그대로 두고 천장만 올린다
+  status:{},        // 미션ID → true(성공) / false(실패). 재출제 성공 시 덮어쓴다
+  playlist:[],      // 현재 라운드의 진행 목록 {def, retry}
+  retried:false,
+  m:null, p:null,
+  fx:null, shake:null,
+  last:0
+};
+const setState = s => { G.state = s; G.t = 0; };
+
+// ══ 유틸 ═══════════════════════════════════════════════════════
+// 입력 판정용 히트박스 — 최소 터치 타깃 140을 보장한다 (8장)
+const hit = (o, x, y) =>
+  Math.abs(x - o.x) <= Math.max(o.w, MIN_TOUCH) / 2 &&
+  Math.abs(y - o.y) <= Math.max(o.h, MIN_TOUCH) / 2;
+
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rad = d => d * Math.PI / 180;
+
+function txt(s, x, y, size, color, align, weight) {
+  ctx.font = `${weight || 800} ${size}px ${FONT}`;
+  ctx.fillStyle = color; ctx.textAlign = align || 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+// 폭에 맞춰 줄을 나눈다. 한국어는 공백이 적어 단어 하나가 넘치면 글자 단위로 쪼갠다.
+function wrapLines(s, maxW, size, weight) {
+  ctx.font = `${weight || 600} ${size}px ${FONT}`;
+  const out = [];
+  let cur = '';
+  for (const w of String(s).split(' ')) {
+    let word = w;
+    const joined = cur ? cur + ' ' + word : word;
+    if (ctx.measureText(joined).width <= maxW) { cur = joined; continue; }
+    if (cur) { out.push(cur); cur = ''; }
+    while (ctx.measureText(word).width > maxW && word.length > 1) {
+      let i = 1;
+      while (i < word.length && ctx.measureText(word.slice(0, i + 1)).width <= maxW) i++;
+      out.push(word.slice(0, i));
+      word = word.slice(i);
+    }
+    cur = word;
+  }
+  if (cur) out.push(cur);
+  return out.length ? out : [''];
+}
+// 여러 줄로 그린다. y는 문단의 세로 중심. maxLines를 넘으면 마지막 줄만 말줄임.
+function para(s, x, y, maxW, size, lh, color, align, maxLines, weight) {
+  const all = wrapLines(s, maxW, size, weight);
+  const use = all.slice(0, maxLines || 2);
+  if (all.length > use.length) use[use.length - 1] = use[use.length - 1].slice(0, -1) + '…';
+  const y0 = y - (use.length - 1) * lh / 2;
+  use.forEach((l, i) => txt(l, x, y0 + i * lh, size, color, align || 'left', weight || 600));
+  return use.length;
+}
+// 밝은 면 위에는 어두운 글자
+function fg(hex) {
+  if (hex.charAt(0) !== '#') return C.text;
+  const n = parseInt(hex.slice(1), 16);
+  const l = (((n >> 16) & 255) * .299 + ((n >> 8) & 255) * .587 + (n & 255) * .114) / 255;
+  return l > .6 ? C.ink : C.text;
+}
+const flash = (color, dur, pulses) => { G.fx = { color, t:0, dur, pulses: pulses || 1 }; };
+const shake = (dur, mag) => { G.shake = { t:0, dur, mag }; };
+
+// ══ 진행 제어 ══════════════════════════════════════════════════
+function buildPlaylist() {
+  G.playlist = ROUNDS[G.roundIdx].defs.map(def => ({ def, retry:false }));
+  G.missionIdx = 0;
+  G.retried = false;
+}
+
+function startMission() {
+  const entry = G.playlist[G.missionIdx];
+  const def = entry.def;
+  G.m = {
+    def, entry,
+    objs: def.objects.map(o => Object.assign({ angle:0 }, o)),   // 런타임 복사본
+    s: {},                                                        // 미션별 스크래치(판정↔연출 공유)
+    limit: def.timeLimit * ROUNDS[G.roundIdx].mult,
+    left:  def.timeLimit * ROUNDS[G.roundIdx].mult,
+    elapsed: 0, tick: 99, msg:'', ok:false
+  };
+  G.p = null;
+  setState(entry.retry ? 'MISSION_RETRY' : 'MISSION_CUE');
+}
+
+function resolve(r) {
+  const m = G.m;
+  m.ok = r.result === 'success';
+  m.msg = m.ok ? (m.def.successMsg || '성공!') : r.reason;
+  G.status[m.def.id] = m.ok;                    // 재출제 성공이면 실패 기록을 덮어쓴다
+  if (!m.entry.retry) G.done++;
+  if (m.ok) {
+    m.fast = m.left / m.limit > .6;             // 제한시간 40% 안에 끝냈다
+    G.combo++;
+    G.best = Math.max(G.best, G.combo);
+    flash(C.safe, 500);
+    SFX.success(G.combo);
+    if (m.fast) SFX.fast();
+  } else {
+    G.combo = 0;
+    G.lives = Math.max(0, G.lives - 1);         // 0 아래로 내려가지 않는다. 게임은 계속된다.
+    duck();
+    if (r.trap) { flash(C.warn, 700, 2); shake(400, 26); SFX.boom(); }
+    else        { flash(C.danger, 500);    shake(300, 18); SFX.fail(); }
+  }
+  G.p = null;
+  setState('MISSION_RESULT');
+}
+
+function judge(ev) {
+  const r = CHECKS[G.m.def.check](G.m, ev);
+  if (r) resolve(r);
+  else if (ev.type === 'timeout') resolve({ result:'fail', reason:'시간 초과' });
+}
+
+// 3.8장: 라운드 종료 시 그 라운드에서 실패한 미션을 최대 2개까지 즉시 재출제
+function queueRetries() {
+  G.retried = true;
+  const fails = ROUNDS[G.roundIdx].defs.filter(d => G.status[d.id] === false).slice(0, MAX_RETRY);
+  for (const def of fails) G.playlist.push({ def, retry:true });
+  return fails.length > 0;
+}
+
+function nextMission() {
+  G.missionIdx++;
+  if (G.missionIdx >= G.playlist.length && !G.retried) queueRetries();
+  if (G.missionIdx < G.playlist.length) startMission();
+  else setState('ROUND_RESULT');
+}
+
+function nextRound() {
+  G.roundIdx++;
+  if (G.roundIdx < ROUNDS.length) { buildPlaylist(); setState('ROUND_INTRO'); }
+  else { bgmStop(); SFX.grade(); setState('ENDING'); }
+}
+
+function startGame() {
+  G.lives = 3; G.roundIdx = 0; G.done = 0; G.status = {}; G.combo = 0; G.best = 0;
+  bgmStart();
+  buildPlaylist();
+  setState('ROUND_INTRO');
+}
+function toTitle() { G.m = null; G.fx = null; G.shake = null; bgmStop(); setState('TITLE'); }
+
+// ══ 입력 (3.1장) ═══════════════════════════════════════════════
+// 화면 좌표 → 기준 좌표 (레터박스/스케일 역변환)
+function toBase(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+function pick(m, x, y) {
+  for (let i = m.objs.length - 1; i >= 0; i--) {          // 위에 그려진 것 우선
+    const o = m.objs[i];
+    if (o.interact !== 'none' && !o.hidden && hit(o, x, y)) return o;
+  }
+  return null;
+}
+const angleTo = (o, x, y) => Math.atan2(y - o.y, x - o.x) * 180 / Math.PI;
+// ±180° 경계에서 부호가 뒤집히지 않도록 보정 (3.1장)
+const wrap180 = d => { while (d > 180) d -= 360; while (d < -180) d += 360; return d; };
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  initAudio();                                   // 오디오는 첫 사용자 제스처에서 열린다
+  const b = toBase(e);
+
+  if (G.state === 'TITLE')  { startGame(); return; }
+  if (G.state === 'ENDING') { toTitle(); return; }
+  if (G.state !== 'MISSION_PLAY' || G.p) return;
+
+  const o = pick(G.m, b.x, b.y);
+  G.p = { id:e.pointerId, x0:b.x, y0:b.y, x:b.x, y:b.y, t0:performance.now(), dragKey:null, rotKey:null, rubKey:null };
+  if (o && o.interact === 'drag') {
+    G.p.dragKey = o.key; G.p.ox = o.x - b.x; G.p.oy = o.y - b.y;
+  } else if (o && o.interact === 'rotate') {
+    G.p.rotKey = o.key; G.p.aPrev = angleTo(o, b.x, b.y);
+  } else if (o && o.interact === 'rub') {
+    G.p.rubKey = o.key;
+  }
+}, { passive:false });
+
+cv.addEventListener('pointermove', e => {
+  if (!G.p || e.pointerId !== G.p.id || G.state !== 'MISSION_PLAY') return;
+  const b = toBase(e);
+  const px = G.p.x, py = G.p.y;
+  G.p.x = b.x; G.p.y = b.y;
+
+  if (G.p.dragKey) {
+    const o = obj(G.m, G.p.dragKey);
+    if (o.axis !== 'y') o.x = b.x + G.p.ox;                          // axis:'y'면 x 고정
+    o.y = b.y + G.p.oy;
+    if (o.clamp) o.y = clamp(o.y, o.clamp[0], o.clamp[1]);
+  } else if (G.p.rotKey) {
+    const o = obj(G.m, G.p.rotKey);
+    const a = angleTo(o, b.x, b.y);
+    o.angle += wrap180(a - G.p.aPrev);                               // 누적 각도
+    G.p.aPrev = a;
+    judge({ type:'rotate', objKey:o.key, angle:o.angle });
+  } else if (G.p.rubKey) {
+    const o = obj(G.m, G.p.rubKey);
+    if (hit(o, b.x, b.y))                                            // 오브젝트 위에서만 문질러진다
+      judge({ type:'rub', objKey:o.key, x:b.x, y:b.y, dist:Math.hypot(b.x - px, b.y - py) });
+  }
+}, { passive:false });
+
+function endPointer(e) {
+  if (!G.p || e.pointerId !== G.p.id) return;
+  const p = G.p; G.p = null;
+  if (G.state !== 'MISSION_PLAY') return;
+
+  if (p.dragKey) { judge({ type:'dragEnd', objKey:p.dragKey, x:p.x, y:p.y }); return; }
+  if (p.rotKey || p.rubKey) return;                                  // 회전·문지르기는 move에서 이미 판정
+
+  const moved = Math.hypot(p.x - p.x0, p.y - p.y0);
+  if (moved >= 40 || performance.now() - p.t0 >= 500) return;        // 탭 아님
+
+  const o = pick(G.m, p.x, p.y);
+  if (o && o.trap) { resolve({ result:'fail', reason:G.m.def.trapReason, trap:true }); return; }
+  judge({ type:'tap', objKey:o ? o.key : null, x:p.x, y:p.y });
+}
+cv.addEventListener('pointerup', endPointer);
+cv.addEventListener('pointercancel', endPointer);
+document.addEventListener('gesturestart', e => e.preventDefault());
+document.addEventListener('dblclick', e => e.preventDefault());
+
+// ══ 업데이트 ═══════════════════════════════════════════════════
+function update(dt) {
+  G.t += dt;
+  if (G.fx)    { G.fx.t    += dt; if (G.fx.t    >= G.fx.dur)    G.fx = null; }
+  if (G.shake) { G.shake.t += dt; if (G.shake.t >= G.shake.dur) G.shake = null; }
+
+  switch (G.state) {
+    case 'BOOT': toTitle(); break;
+
+    case 'ROUND_INTRO':
+      if (G.t >= DUR.ROUND_INTRO) startMission();
+      break;
+
+    case 'MISSION_RETRY':
+      G.m.elapsed += dt;
+      if (G.t >= DUR.MISSION_RETRY) setState('MISSION_CUE');
+      break;
+
+    case 'MISSION_CUE':
+      G.m.elapsed += dt;
+      if (G.t >= DUR.MISSION_CUE * ROUNDS[G.roundIdx].mult) setState('MISSION_PLAY');
+      break;
+
+    case 'MISSION_PLAY': {
+      const m = G.m;
+      m.elapsed += dt;
+      m.left -= dt;
+      // 목표 영역 하이라이트 — 드래그 중인 오브젝트가 영역(또는 snap 반경) 안이면
+      const held = G.p && G.p.dragKey ? obj(m, G.p.dragKey) : null;
+      for (const z of m.objs) if (z.zone)
+        z.hot = !!held && (z.snap ? Math.hypot(held.x - z.x, held.y - z.y) <= z.snap : inRect(held, z));
+      // 남은 시간 1초 이하 틱
+      const sec = Math.ceil(m.left / 1000);
+      if (sec <= 1 && sec !== m.tick) { m.tick = sec; if (sec > 0) SFX.tick(); }
+      if (m.left <= 0) { m.left = 0; judge({ type:'timeout' }); }
+      break;
+    }
+
+    case 'MISSION_RESULT':
+      G.m.elapsed += dt;
+      if (G.t >= DUR.MISSION_RESULT) nextMission();
+      break;
+
+    case 'ROUND_RESULT':
+      if (G.t >= DUR.ROUND_RESULT) nextRound();
+      break;
+
+    case 'ENDING':
+      if (G.t >= DUR.ENDING) toTitle();
+      break;
+  }
+}
+
+// ══ 연출 헬퍼 ══════════════════════════════════════════════════
+// 배경을 눌러 두는 막. 배경은 "여기가 어디인지"만 알려주고 물러난다.
+const BG_SCRIM = 'rgba(18,20,26,.60)';
+// 미션 데이터의 fog 값 → [색, 최대 진하기, 차오르는 속도, 최대 높이]
+const FOG = { gas:['245,200,60', .34, .22, 760], co:['210,215,220', .22, .18, 600] };
+
+// 만질 수 있는 것 뒤에 깔리는 빛. 어두운 배경 위에서 조작 대상만 떠 보인다.
+function spotlight(o) {
+  const r = Math.max(o.w, o.h) * .9;
+  const g = ctx.createRadialGradient(o.x, o.y, 0, o.x, o.y, r);
+  g.addColorStop(0, 'rgba(255,255,255,.20)');
+  g.addColorStop(.6, 'rgba(255,255,255,.07)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(o.x, o.y, r, 0, 7); ctx.fill();
+}
+
+// 목표 지점 표식 — 깜박여서 "여기로 옮겨라"가 바로 읽히게 한다
+function targetRing(o, m) {
+  const p = .55 + .45 * Math.sin(m.elapsed / 320);
+  ctx.save();
+  ctx.setLineDash([22, 16]); ctx.lineWidth = o.hot ? 11 : 8;
+  ctx.strokeStyle = o.hot ? C.safe : `rgba(46,204,143,${(.35 + p * .5).toFixed(3)})`;
+  ctx.strokeRect(o.x - o.w / 2, o.y - o.h / 2, o.w, o.h);
+  ctx.restore();
+  if (o.hot) txt('✓', o.x, o.y - o.h / 2 - 36, 54, C.safe);
+}
+
+// 하단에서 차오르는 안개. 가스=노랑, CO=아주 옅은 회색(무색무취 표현)
+function fog(m, rgb, alpha, speed, maxH, box) {
+  const h = Math.min(maxH, m.elapsed * speed);
+  const bottom = box ? box.y + box.h / 2 : H;
+  const top = Math.max(box ? box.y - box.h / 2 : 470, bottom - h);
+  if (bottom - top <= 0) return;
+  const g = ctx.createLinearGradient(0, top, 0, bottom);
+  g.addColorStop(0, `rgba(${rgb},0)`);
+  g.addColorStop(1, `rgba(${rgb},${alpha})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(box ? box.x - box.w / 2 : 0, top, box ? box.w : W, bottom - top);
+}
+function steam(m, o) {
+  for (let i = 0; i < 3; i++) {
+    const t = ((m.elapsed / 900) + i / 3) % 1;
+    ctx.globalAlpha = (1 - t) * .45;
+    ctx.fillStyle = '#FFFFFF';
+    ctx.beginPath();
+    ctx.arc(o.x - 60 + i * 60 + Math.sin(t * 6 + i) * 18, o.y - o.h / 2 - 40 - t * 150, 22 + t * 26, 0, 7);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function flame(x, y, t) {
+  for (let i = -1; i <= 1; i++) {
+    const w = 34 + Math.sin(t / 90 + i) * 8, h = 80 + Math.cos(t / 70 + i) * 18, cx = x + i * 36;
+    ctx.fillStyle = i === 0 ? C.warn : C.danger;
+    ctx.beginPath();
+    ctx.moveTo(cx, y); ctx.lineTo(cx - w / 2, y - h * .4); ctx.lineTo(cx, y - h); ctx.lineTo(cx + w / 2, y - h * .4);
+    ctx.closePath(); ctx.fill();
+  }
+}
+// ── 고스트 힌트 ────────────────────────────────────────────────
+// 한 번 틀려서 재출제된 미션에서만 동작을 시연한다. 처음부터 알려주지 않는다.
+function ghostHand(x, y) {
+  ctx.beginPath(); ctx.arc(x, y, 34, 0, 7);
+  ctx.fillStyle = 'rgba(255,255,255,.45)'; ctx.fill();
+  ctx.lineWidth = 6; ctx.strokeStyle = C.text; ctx.stroke();
+}
+function drawGhost(m) {
+  const h = m.def.hint;
+  if (!h) return;
+  const o = obj(m, h[0]);
+  if (!o || o.hidden) return;
+  const dst = h[1] ? obj(m, h[1]) : null;
+  const t = (m.elapsed % 1400) / 1400;          // 1.4초마다 반복
+  const e = Math.min(1, t / .8);                // 앞 80%만 움직이고 쉰다
+  let x = o.x, y = o.y;
+
+  ctx.save();
+  ctx.globalAlpha = t < .9 ? .9 : .9 * (1 - (t - .9) / .1);
+  ctx.setLineDash([16, 14]); ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(255,255,255,.5)';
+  if (o.interact === 'drag' && dst) {                       // 옮기기 — 목표까지 선 + 이동
+    ctx.beginPath(); ctx.moveTo(o.x, o.y); ctx.lineTo(dst.x, dst.y); ctx.stroke();
+    x = o.x + (dst.x - o.x) * e; y = o.y + (dst.y - o.y) * e;
+  } else if (o.interact === 'drag' && o.clamp) {            // 슬라이더 — 아래로
+    ctx.beginPath(); ctx.moveTo(o.x, o.clamp[0]); ctx.lineTo(o.x, o.clamp[1]); ctx.stroke();
+    y = o.clamp[0] + (o.clamp[1] - o.clamp[0]) * e;
+  } else if (o.interact === 'rotate') {                     // 돌리기 — 호를 따라
+    const r = Math.max(o.w, o.h) * .38;
+    ctx.beginPath(); ctx.arc(o.x, o.y, r, rad(-90), rad(-90 + o.targetAngle)); ctx.stroke();
+    const a = rad(-90 + o.targetAngle * e);
+    x = o.x + Math.cos(a) * r; y = o.y + Math.sin(a) * r;
+  } else if (o.interact === 'rub') {                        // 문지르기 — 좌우 왕복
+    x = o.x + Math.sin(e * Math.PI * 3) * (o.w * .4);
+  } else {                                                  // 탭 — 깜박임
+    ctx.globalAlpha *= .35 + .65 * Math.abs(Math.sin(t * Math.PI * 2));
+  }
+  ghostHand(x, y);
+  ctx.restore();
+}
+
+function warnIcon(x, y, r) {
+  ctx.fillStyle = C.danger;
+  ctx.beginPath(); ctx.moveTo(x, y - r); ctx.lineTo(x + r, y + r * .8); ctx.lineTo(x - r, y + r * .8);
+  ctx.closePath(); ctx.fill();
+  txt('!', x, y + r * .2, r * 1.1, C.text);
+}
+
+// ══ 미션별 연출 ════════════════════════════════════════════════
+// 오브젝트 위에 덧그린다. 없는 미션은 기본 렌더만 나간다.
+const FX = {
+  // 큰 불판이 삼발이 밖으로 튀어나온 양 끝을 짚어준다 — 왜 바꿔야 하는지 보이게
+  A2(m) {
+    const bp = obj(m, 'bigPan'), sp = obj(m, 'smallPan');
+    if (bp.hidden) return;
+    warnIcon(bp.x - bp.w / 2 + 44, bp.y, 34);
+    warnIcon(bp.x + bp.w / 2 - 44, bp.y, 34);
+    txt('작은 불판', sp.x, sp.y + sp.h / 2 + 46, 44, C.text);   // 얇고 어두워 눈에 안 띈다
+  },
+  // 장착 소켓을 링으로 그리고, 캔의 홈 표식을 초록 홈 자리에 맞추게 한다.
+  // 링 위 주황 점 = 지금 홈 위치 / 초록 구간 = 맞춰야 할 자리.
+  A3(m) {
+    const can = obj(m, 'can'), g = obj(m, 'guide');
+    const R = g.w * .5, tgt = can.targetAngle, tol = can.tolerance || 15;
+    const off = wrap180(can.angle - tgt), ok = Math.abs(off) <= tol;
+    const A = d => rad(d - 90);                       // 화면 기준: 위쪽이 0°
+    const pulse = .55 + .45 * Math.sin(m.elapsed / 260);
+
+    ctx.save();
+    ctx.lineCap = 'butt';
+    ctx.lineWidth = 30; ctx.strokeStyle = 'rgba(24,28,36,.85)';            // 소켓 링
+    ctx.beginPath(); ctx.arc(g.x, g.y, R, 0, 7); ctx.stroke();
+    ctx.lineWidth = 30;                                                     // 맞춰야 할 홈
+    ctx.strokeStyle = ok ? C.safe : `rgba(46,204,143,${(.35 + pulse * .5).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(g.x, g.y, R, A(tgt - tol), A(tgt + tol)); ctx.stroke();
+
+    if (!ok) {                                                              // 어느 쪽으로 돌릴지
+      ctx.lineWidth = 9; ctx.strokeStyle = 'rgba(255,255,255,.45)';
+      ctx.setLineDash([15, 13]);
+      ctx.beginPath(); ctx.arc(g.x, g.y, R + 46, A(can.angle), A(tgt), off > 0);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    const mx = g.x + Math.cos(A(can.angle)) * R;                            // 캔의 홈 표식
+    const my = g.y + Math.sin(A(can.angle)) * R;
+    ctx.beginPath(); ctx.arc(mx, my, 27, 0, 7);
+    ctx.fillStyle = ok ? C.safe : C.warn; ctx.fill();
+    ctx.lineWidth = 7; ctx.strokeStyle = C.ink; ctx.stroke();
+    ctx.restore();
+
+    txt(ok ? '홈이 맞았어요' : '표식을 초록 자리로',
+        g.x, g.y + R + 92, 44, ok ? C.safe : C.dim, 'center', 700);
+  },
+  A5(m) {
+    const can = obj(m, 'can'), n = m.s.hits || 0, bw = 260;
+    ctx.fillStyle = C.ink;
+    for (let i = 0; i < Math.floor(n); i++) {
+      ctx.beginPath(); ctx.arc(can.x - 60 + i * 32, can.y - 70, 13, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = C.slot; ctx.fillRect(can.x - bw / 2, can.y + 200, bw, 28);
+    ctx.fillStyle = C.safe; ctx.fillRect(can.x - bw / 2, can.y + 200, bw * Math.min(1, n / A5_NEED), 28);
+    ctx.lineWidth = 5; ctx.strokeStyle = C.ink; ctx.strokeRect(can.x - bw / 2, can.y + 200, bw, 28);
+    if (n > 0 && n < A5_NEED)
+      txt('쉬-', can.x + 150, can.y - 60 - ((m.elapsed % 500) / 500) * 60, 46, C.warn);
+  },
+  // 시간이 갈수록 국물이 차오른다 — 넘치기 전에 꺼야 한다는 예비 신호
+  B1(m) {
+    const pot = obj(m, 'pot'), p = clamp(1 - m.left / m.limit, 0, 1);
+    if (!m.s.off) flame(pot.x, pot.y + pot.h / 2 + 46, m.elapsed);
+    const h = pot.h * (.10 + .42 * p);
+    ctx.fillStyle = p > .75 ? 'rgba(245,166,35,.55)' : 'rgba(255,255,255,.32)';
+    ctx.fillRect(pot.x - pot.w / 2 + 26, pot.y + pot.h / 2 - h, pot.w - 52, h);
+    steam(m, pot);
+    if (p > .75) txt('넘치기 직전!', pot.x, pot.y - pot.h / 2 - 24, 46, C.warn);
+  },
+  // 실내 가스 농도 게이지. 초록 구간에 들어왔을 때만 점화해야 한다.
+  B4(m) {
+    const p = clamp(1 - m.left / m.limit, 0, 1);
+    const x = 120, y = 1000, w = W - 240, h = 66, safe = p >= B4_SAFE[0] && p <= B4_SAFE[1];
+    txt('실내 가스 농도', W / 2, y - 60, 44, C.dim, 'center', 600);
+    ctx.fillStyle = '#20242D'; ctx.fillRect(x, y, w, h);
+    ctx.fillStyle = 'rgba(46,204,143,.5)';
+    ctx.fillRect(x + w * B4_SAFE[0], y, w * (B4_SAFE[1] - B4_SAFE[0]), h);
+    ctx.lineWidth = 5; ctx.strokeStyle = C.ink; ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = safe ? C.safe : C.danger;
+    ctx.fillRect(x + w * p - 8, y - 20, 16, h + 40);
+    txt(safe ? '지금!' : '기다려', x + w * (B4_SAFE[0] + B4_SAFE[1]) / 2, y + h + 54, 44,
+        safe ? C.safe : C.dim, 'center', safe ? 800 : 600);
+  },
+  B3(m) {
+    const pot = obj(m, 'pot'), s = obj(m, 'slider');
+    const heat = 1 - clamp((s.y - s.clamp[0]) / (s.clamp[1] - s.clamp[0]), 0, 1);   // 위=강불
+    const h = pot.h * .14 + pot.h * .52 * heat;
+    ctx.fillStyle = 'rgba(255,255,255,.32)';
+    ctx.fillRect(pot.x - pot.w / 2 + 16, pot.y + pot.h / 2 - h, pot.w - 32, h);
+    txt(heat > .5 ? '강' : '약', s.x, s.y, 44, C.ink);
+    if (heat > .6) steam(m, pot);
+  },
+  C4(m) {
+    const h = obj(m, 'hose');
+    if (m.s.x0 !== undefined) {                                   // 문지른 자리에 비눗물이 남는다
+      ctx.fillStyle = 'rgba(190,235,255,.40)';
+      ctx.fillRect(m.s.x0, h.y - 48, Math.max(8, m.s.x1 - m.s.x0), 96);
+    }
+    const f = (m.s.found || 0) / C4_NEED;
+    if (f <= 0) return;
+    const lx = c4Leak(m);                                          // 누출 지점에서 거품이 부푼다
+    for (let i = 0; i < 7; i++) {
+      const t = ((m.elapsed / 600) + i / 7) % 1;
+      ctx.globalAlpha = (1 - t) * Math.min(1, f + .25);
+      ctx.fillStyle = '#CFF6E6';
+      ctx.beginPath();
+      ctx.arc(lx + Math.sin(t * 7 + i * 2) * 26, h.y - 20 - t * 110, (5 + t * 12) * (.5 + f), 0, 7);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  },
+  D1(m) {
+    const box = obj(m, 'box'), v = obj(m, 'vent');
+    if (Math.abs(box.x - v.x) < (box.w + v.w) / 2 && Math.abs(box.y - v.y) < (box.h + v.h) / 2)
+      warnIcon(v.x + v.w / 2 + 60, v.y, 48);
+  }
+};
+
+// ══ 렌더 ═══════════════════════════════════════════════════════
+// 에셋이 있으면 이미지, 없으면 색 사각형 + 라벨. 이미지 교체는 이 함수 안만 고친다. (6장)
+function drawObject(o, m) {
+  if (o.hidden) return;
+  const img = o.img ? asset(o.img) : null;
+  const x = -o.w / 2, y = -o.h / 2, r = Math.min(24, o.w / 6, o.h / 6);
+
+  ctx.save();
+  ctx.translate(o.x, o.y);
+  if (o.angle) ctx.rotate(rad(o.angle));
+  if (img) {
+    const f = fit(img.naturalWidth, img.naturalHeight, o.w, o.h);
+    ctx.drawImage(img, -f.w / 2, -f.h / 2, f.w, f.h);
+  } else if (o.zone) {
+    ctx.fillStyle = o.hot ? 'rgba(46,204,143,.22)' : 'rgba(46,204,143,.10)';
+    ctx.beginPath(); ctx.roundRect(x, y, o.w, o.h, r); ctx.fill();
+  } else if (o.overlay) {
+    ctx.fillStyle = o.color;
+    ctx.beginPath(); ctx.roundRect(x, y, o.w, o.h, r); ctx.fill();
+  } else {
+    ctx.fillStyle = o.color;
+    ctx.beginPath(); ctx.roundRect(x, y, o.w, o.h, r); ctx.fill();
+    ctx.lineWidth = 8; ctx.strokeStyle = C.ink; ctx.stroke();
+  }
+  ctx.restore();
+
+  if (o.zone) targetRing(o, m);          // 그림 유무와 무관하게 목표 표식은 항상
+  if (img || !o.label) return;
+  drawLabel(o);
+}
+// 라벨은 회전시키지 않는다 (원거리 가독성)
+function drawLabel(o) {
+  if (o.zone) {
+    txt(o.label, o.x, o.y, 46, o.hot ? C.safe : 'rgba(255,255,255,.85)');
+  } else if (o.overlay) {
+    txt(o.label, o.x, o.y - o.h / 2 + 54, 46, C.warn);
+  } else {
+    const fit = o.w * .82 / o.label.length;
+    if (fit >= 30) txt(o.label, o.x, o.y, Math.min(48, fit), fg(o.color));
+    else           txt(o.label, o.x, o.y + o.h / 2 + 34, 38, C.text);      // 좁으면 아래에
+  }
+}
+
+function drawPlayfield() {
+  const m = G.m;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 470, W, H - 470); ctx.clip();
+  const bgi = m.def.bgImage ? asset(m.def.bgImage, '.jpg') : null;
+  if (bgi) {                                              // 플레이 영역에 cover
+    const s = Math.max(W / bgi.naturalWidth, (H - 470) / bgi.naturalHeight);
+    const iw = bgi.naturalWidth * s, ih = bgi.naturalHeight * s;
+    ctx.drawImage(bgi, (W - iw) / 2, 470 + (H - 470 - ih) / 2, iw, ih);
+  } else {
+    ctx.fillStyle = m.def.bg; ctx.fillRect(0, 470, W, H - 470);
+  }
+  // 배경은 맥락일 뿐이다. 어둡게 깔아 만질 것에 눈이 가게 한다.
+  ctx.fillStyle = BG_SCRIM; ctx.fillRect(0, 470, W, H - 470);
+
+  const held = G.p && G.p.dragKey;
+  const normal = m.objs.filter(o => !o.overlay && o.key !== held);
+  const over   = m.objs.filter(o =>  o.overlay && o.key !== held);
+  for (const o of m.objs) if (o.interact !== 'none' && !o.hidden) spotlight(o);
+  for (const o of normal) drawObject(o, m);
+  if (FX[m.def.id]) FX[m.def.id](m);
+  for (const o of over) drawObject(o, m);
+  if (held) drawObject(obj(m, held), m);                  // 잡고 있는 건 맨 위
+  if (m.def.fog) {
+    const f = FOG[m.def.fog];
+    fog(m, f[0], f[1], f[2], f[3], m.def.fogBox ? obj(m, m.def.fogBox) : null);
+  }
+  if (m.entry.retry) drawGhost(m);
+  ctx.restore();
+}
+
+function drawHUD() {
+  ctx.fillStyle = C.hud; ctx.fillRect(0, 0, W, 220);
+  for (let i = 0; i < 3; i++) {                            // 색 + 모양 + 숫자 3중 표기 (8장)
+    txt(i < G.lives ? '♥' : '♡', 80 + i * 78, 108, 72, i < G.lives ? C.danger : C.slot);
+  }
+  txt(`${G.lives}`, 80 + 3 * 78 + 20, 108, 52, C.dim, 'left', 700);
+  txt(`라운드 ${G.roundIdx + 1}`, W - 56, 78, 46, C.dim, 'right', 700);
+  txt(`${G.done} / ${TOTAL}`,     W - 56, 148, 52, C.text, 'right', 800);
+  if (G.combo >= 2) {                                    // 2연속부터 보인다
+    const k = 1 + .18 * Math.max(0, 1 - G.t / 260);      // 올라갈 때 살짝 튄다
+    ctx.save(); ctx.translate(W / 2, 120); ctx.scale(k, k);
+    txt(`${G.combo} 연속!`, 0, 0, 62, G.combo >= 5 ? C.warn : C.safe);
+    ctx.restore();
+  }
+}
+
+function drawCue() {
+  const k = G.state === 'MISSION_CUE' ? 1 + .35 * Math.max(0, 1 - G.t / 250) : 1;
+  ctx.save();
+  ctx.translate(W / 2, 320); ctx.scale(k, k);
+  txt(G.m.def.cue, 0, 0, 160, C.text);
+  ctx.restore();
+}
+
+function drawTimer() {
+  const m = G.m, p = Math.max(0, m.left / m.limit);
+  ctx.fillStyle = '#252A33'; ctx.fillRect(0, 420, W, 50);
+  ctx.fillStyle = p > .35 ? C.safe : C.danger;
+  ctx.fillRect(0, 420, W * p, 50);
+  txt(`${(m.left / 1000).toFixed(1)}`, W - 24, 445, 34, C.text, 'right', 700);
+}
+
+function drawBanner(text, ok) {
+  ctx.fillStyle = 'rgba(14,17,22,.92)'; ctx.fillRect(0, 1450, W, 270);
+  ctx.fillStyle = ok ? C.safe : C.danger; ctx.fillRect(0, 1450, W, 12);
+  txt(ok ? '✓' : '✕', 104, 1570, 76, ok ? C.safe : C.danger);
+  if (ok && G.m.fast) txt('빨라!', 104, 1648, 36, C.warn);
+  para(text, 190, 1585, W - 250, 48, 60, C.text, 'left', 2);
+}
+
+function drawTitle() {
+  ctx.fillStyle = C.void; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = C.safe; ctx.fillRect(0, 560, W, 14);
+  txt('잠가!', W / 2, 760,  190, C.text);
+  txt('열어!', W / 2, 950,  190, C.warn);
+  txt('꺼!',   W / 2, 1140, 190, C.danger);
+  ctx.fillStyle = C.safe; ctx.fillRect(0, 1260, W, 14);
+  txt('가스안전 3분 챌린지', W / 2, 1370, 56, C.dim, 'center', 600);
+  txt(`미션 ${TOTAL}개 · 3라운드`, W / 2, 1450, 42, C.dim, 'center', 600);
+  if (Math.floor(G.t / 500) % 2 === 0) txt('화면을 터치하세요', W / 2, 1680, 62, C.text);
+}
+
+function drawRoundIntro() {
+  ctx.fillStyle = C.void; ctx.fillRect(0, 0, W, H);
+  txt(`라운드 ${G.roundIdx + 1}`, W / 2, H / 2 - 70, 150, C.text);
+  txt(`제한시간 ${(5 * ROUNDS[G.roundIdx].mult).toFixed(1)}초`, W / 2, H / 2 + 80, 58, C.warn, 'center', 700);
+}
+
+function drawRoundResult() {
+  const defs = ROUNDS[G.roundIdx].defs;
+  const n = defs.filter(d => G.status[d.id]).length;
+  ctx.fillStyle = C.void; ctx.fillRect(0, 0, W, H);
+  txt('라운드 종료', W / 2, H / 2 - 150, 76, C.dim, 'center', 600);
+  txt(`${n} / ${defs.length}`, W / 2, H / 2 + 20, 200, n === defs.length ? C.safe : C.text);
+}
+
+function grade(ok) {
+  if (ok === TOTAL) return { name:'가스안전 대장', color:C.safe };
+  if (ok >= Math.ceil(TOTAL * .8)) return { name:'가스안전 반장', color:C.warn };
+  return { name:'가스안전 요원', color:C.dim };
+}
+
+function drawEnding() {
+  const done = Object.keys(G.status);
+  const ok = done.filter(id => G.status[id]).length;
+  const missed = MISSIONS.filter(m => G.status[m.id] === false);
+  const g = grade(ok);
+
+  ctx.fillStyle = C.void; ctx.fillRect(0, 0, W, H);
+  txt(`${ok} / ${TOTAL} 성공`, W / 2, 296, 60, C.dim, 'center', 600);
+  txt(g.name, W / 2, 436, 116, g.color);
+  txt(`최고 ${G.best}연속`, W / 2, 542, 48, C.warn, 'center', 700);
+
+  ctx.fillStyle = '#20242D'; ctx.fillRect(80, 620, W - 160, 1080);
+  ctx.fillStyle = C.warn;    ctx.fillRect(80, 620, W - 160, 12);
+  txt('내가 놓친 수칙', W / 2, 720, 62, C.warn);
+
+  if (!missed.length) {
+    txt('없습니다. 전부 해냈어요!', W / 2, 900, 54, C.safe, 'center', 700);
+  } else {
+    const show = missed.slice(0, 5);
+    show.forEach((m, i) => {
+      const y = 880 + i * 150;
+      ctx.fillStyle = C.danger; ctx.fillRect(140, y - 52, 8, 104);
+      txt(m.cue, 178, y, 38, C.warn, 'left', 800);
+      para(m.rule, 336, y, W - 500, 34, 46, C.text, 'left', 3);
+    });
+    if (missed.length > show.length)
+      txt(`외 ${missed.length - show.length}개`, W / 2, 880 + show.length * 150, 38, C.dim, 'center', 600);
+  }
+
+  txt(`${Math.ceil((DUR.ENDING - G.t) / 1000)}초 후 처음으로`, W - 56, H - 70, 40, C.dim, 'right', 600);
+}
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = C.void; ctx.fillRect(0, 0, W, H);
+
+  if (G.shake) {
+    const k = 1 - G.shake.t / G.shake.dur;
+    ctx.translate(Math.sin(G.shake.t * .06) * G.shake.mag * k, Math.cos(G.shake.t * .083) * G.shake.mag * k);
+  }
+
+  switch (G.state) {
+    case 'TITLE':        drawTitle(); break;
+    case 'ROUND_INTRO':  drawRoundIntro(); break;
+    case 'ROUND_RESULT': drawRoundResult(); break;
+    case 'ENDING':       drawEnding(); break;
+    case 'MISSION_RETRY':
+    case 'MISSION_CUE':
+    case 'MISSION_PLAY':
+    case 'MISSION_RESULT':
+      drawPlayfield();
+      drawHUD();
+      if (G.state === 'MISSION_RETRY') {
+        ctx.fillStyle = 'rgba(26,29,35,.82)'; ctx.fillRect(0, 220, W, 400);
+        txt('다시!', W / 2, 400, 150, C.warn);
+        txt('놓친 수칙을 한 번 더', W / 2, 530, 46, C.dim, 'center', 600);
+      } else {
+        drawCue();
+      }
+      if (G.state === 'MISSION_PLAY') drawTimer();
+      if (G.state === 'MISSION_RESULT') drawBanner(G.m.msg, G.m.ok);
+      break;
+  }
+
+  if (G.fx) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = Math.abs(Math.sin((G.fx.t / G.fx.dur) * Math.PI * G.fx.pulses)) * .5;
+    ctx.fillStyle = G.fx.color; ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ══ 리사이즈: contain 스케일 (2장) ═════════════════════════════
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width  = (W * s) + 'px';
+  cv.style.height = (H * s) + 'px';
+}
+addEventListener('resize', resize);
+addEventListener('orientationchange', resize);
+resize();
+
+// ══ 루프 ═══════════════════════════════════════════════════════
+function loop(now) {
+  const dt = Math.min(50, now - (G.last || now));   // 탭 전환 후 시간 점프 방지
+  G.last = now;
+  update(dt);
+  bgmTick();
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

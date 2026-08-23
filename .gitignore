@@ -1,0 +1,13 @@
+# AI 생성 원본 이미지 (36MB). 게임 실행에는 asset_web/ 만 있으면 된다.
+# 원본이 필요하면 로컬·드라이브 보관본에서 가져와 python tools/prep_assets.py 재실행.
+asset/
+
+# 작업 중 캡처
+예시/
+*.png
+!asset_web/*.png
+
+node_modules/
+.vercel/
+.DS_Store
+Thumbs.db
